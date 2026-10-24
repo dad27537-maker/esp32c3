@@ -1,0 +1,8 @@
+{
+  "folders": [{"path": "."}],
+  "settings": {
+    "files.encoding": "utf8",
+    "files.associations": {"*.h": "cpp"},
+    "python.terminal.executeInFileDir": false
+  }
+}

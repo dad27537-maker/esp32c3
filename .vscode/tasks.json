@@ -1,0 +1,43 @@
+{
+  "version": "2.0.0",
+  "options": {"cwd": "${workspaceFolder}"},
+  "tasks": [
+    {
+      "label": "1. Configure WiFi and PC",
+      "type": "process",
+      "command": "python",
+      "args": ["tools/configure.py"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": []
+    },
+    {
+      "label": "2. Build firmware",
+      "type": "process",
+      "command": "python",
+      "args": ["-m", "platformio", "run"],
+      "group": {"kind": "build", "isDefault": true},
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "3. Upload firmware",
+      "type": "process",
+      "command": "python",
+      "args": ["-m", "platformio", "run", "--target", "upload"],
+      "problemMatcher": []
+    },
+    {
+      "label": "4. Start Windows receiver",
+      "type": "process",
+      "command": "python",
+      "args": ["pc/receiver.py"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Test receiver (no real keystrokes)",
+      "type": "process",
+      "command": "python",
+      "args": ["-m", "unittest", "discover", "-s", "tests", "-v"],
+      "problemMatcher": []
+    }
+  ]
+}
