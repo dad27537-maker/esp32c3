@@ -158,6 +158,15 @@ class KeyboardTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_usb_only_configuration_needs_no_wifi_credentials(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            configure.write_configuration(root, "", "", "127.0.0.1", 8765, wifi_optional=True)
+            config = json.loads((root / "pc" / "receiver_config.json").read_text())
+            header = (root / "include" / "secrets.h").read_text()
+            self.assertIn(configure.cpp_string(config["token"]), header)
+            self.assertIn('#define WIFI_SSID ""', header)
+
     def test_generated_board_and_pc_share_token(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

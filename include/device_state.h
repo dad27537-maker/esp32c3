@@ -2,9 +2,17 @@
 #include <stdint.h>
 
 enum class KeyId : uint8_t { Up, Center, Down, Left, Right };
-enum class Page : uint8_t { Menu, Clipboard, Pomodoro, Hardware, Clock, Volume, Media };
+enum class Page : uint8_t { Menu, Clipboard, Pomodoro, Hardware, Clock, Volume, Media, Coin, Settings };
+enum class ConnectionMode : uint8_t { Wifi, Usb, Bluetooth };
+inline const char* connectionName(ConnectionMode mode) {
+  switch (mode) {
+    case ConnectionMode::Usb: return "usb";
+    case ConnectionMode::Bluetooth: return "ble";
+    default: return "wifi";
+  }
+}
 enum class Action : uint8_t { None, Copy, Paste, VolumeUp, VolumeDown, Mute,
-                              PlayPause, NextTrack, PreviousTrack };
+                              PlayPause, NextTrack, PreviousTrack, SetWifi, SetUsb, SetBluetooth };
 enum class Outcome : uint8_t { Confirmed, Unknown, Rejected, Offline, Expired, Denied, Failed };
 
 inline const char* actionName(Action action) {
@@ -17,6 +25,9 @@ inline const char* actionName(Action action) {
     case Action::PlayPause: return "media_play_pause";
     case Action::NextTrack: return "media_next";
     case Action::PreviousTrack: return "media_previous";
+    case Action::SetWifi: return "set_wifi";
+    case Action::SetUsb: return "set_usb";
+    case Action::SetBluetooth: return "set_ble";
     default: return "none";
   }
 }
@@ -34,6 +45,7 @@ struct PcSnapshot {
   float gpuTemp = -1;
   float vram = -1;
   uint32_t epoch = 0;
+  uint16_t epochFractionMs = 0;
   uint32_t receivedAt = 0;
   uint32_t sampleAgeMs = 0;
 };

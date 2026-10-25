@@ -4,6 +4,7 @@
 #include <time.h>
 #include "device_state.h"
 #include "pomodoro.h"
+#include "coin_flip.h"
 #include "ui_font.h"
 
 namespace UiColor {
@@ -19,7 +20,7 @@ constexpr uint16_t green = rgb(0x39dfb3);
 constexpr uint16_t yellow = rgb(0xf6c661);
 constexpr uint16_t red = rgb(0xff6b7a);
 constexpr uint16_t accents[] = {rgb(0x35ddc5), rgb(0xff8968), rgb(0xb69aff),
-                               rgb(0x78b6ff), rgb(0xf6cd68), rgb(0xff83bb)};
+                               rgb(0x78b6ff), rgb(0xf6cd68), rgb(0xff83bb), rgb(0xffd978), rgb(0x84d6ff)};
 }
 
 // Original 160x80 adaptation of a multifunction controller interface: cards,
@@ -37,8 +38,17 @@ class DeviceUI {
 
   Page page() const { return page_; }
   uint8_t selected() const { return selected_; }
+  uint8_t selectedConnection() const { return selectedConnection_; }
+  void setConnection(ConnectionMode mode, bool connected) {
+    if (connectionMode_ != mode || wifi_ != connected) dirty_ = true;
+    connectionMode_ = mode;
+    wifi_ = connected;
+  }
+  bool coinSpinning() const { return coinSpinning_; }
+  static constexpr uint32_t coinAnimationMs = 1200;
   uint32_t visibleSequence = 0;
   Pomodoro pomodoro;
+  CoinFlip coin;
 
   void snapshot(const PcSnapshot& value) { pc_ = value; dirty_ = true; }
   void setWifi(bool connected) {
@@ -48,6 +58,7 @@ class DeviceUI {
     if (value > functionCount) return;
     page_ = static_cast<Page>(value);
     if (value) selected_ = value - 1;
+    if (page_ == Page::Settings) selectedConnection_ = static_cast<uint8_t>(connectionMode_);
     animating_ = false;
     noticeUntil_ = 0;
     visibleSequence = 0;
@@ -73,6 +84,7 @@ class DeviceUI {
         animating_ = true;
       } else if (key == KeyId::Center) {
         page_ = static_cast<Page>(selected_ + 1);
+        if (page_ == Page::Settings) selectedConnection_ = static_cast<uint8_t>(connectionMode_);
         noticeUntil_ = 0;
         animating_ = false;
       }
@@ -97,6 +109,19 @@ class DeviceUI {
       if (key == KeyId::Center) return Action::PlayPause;
       if (key == KeyId::Down) return Action::NextTrack;
       if (key == KeyId::Up) return Action::PreviousTrack;
+    } else if (page_ == Page::Coin) {
+      if (key == KeyId::Center && !coinSpinning_) {
+        coin.toss();
+        coinAnimationStart_ = now;
+        coinSpinning_ = true;
+      }
+    } else if (page_ == Page::Settings) {
+      if (key == KeyId::Up) selectedConnection_ = (selectedConnection_ + 2) % 3;
+      if (key == KeyId::Down) selectedConnection_ = (selectedConnection_ + 1) % 3;
+      if (key == KeyId::Center) {
+        static const Action actions[] = {Action::SetWifi, Action::SetUsb, Action::SetBluetooth};
+        return actions[selectedConnection_];
+      }
     }
     return Action::None;
   }
@@ -126,7 +151,13 @@ class DeviceUI {
     notice(configured ? "电脑离线" : "未配置网络", UiColor::red, now);
   }
 
-  void tick(uint32_t now) { pomodoro.tick(now); }
+  void tick(uint32_t now) {
+    pomodoro.tick(now);
+    if (coinSpinning_ && uint32_t(now - coinAnimationStart_) >= coinAnimationMs) {
+      coinSpinning_ = false;
+      dirty_ = true;
+    }
+  }
 
   void render(uint32_t now, bool force = false) {
     bool activeNotice = noticeUntil_ && int32_t(noticeUntil_ - now) > 0;
@@ -137,7 +168,8 @@ class DeviceUI {
     }
     const bool phaseFlash = page_ == Page::Pomodoro && pomodoro.completedAt &&
                             uint32_t(now - pomodoro.completedAt) < 2500;
-    if (!force && !dirty_ && !animating_ && !phaseFlash && lastSecond_ == now / 1000) return;
+    const bool coinAnimation = page_ == Page::Coin && coinSpinning_;
+    if (!force && !dirty_ && !animating_ && !phaseFlash && !coinAnimation && lastSecond_ == now / 1000) return;
     if (!force && uint32_t(now - lastDraw_) < 35) return;
     lastDraw_ = now;
     lastSecond_ = now / 1000;
@@ -151,6 +183,8 @@ class DeviceUI {
       case Page::Clock: drawClock(); break;
       case Page::Volume: drawVolume(now); break;
       case Page::Media: drawMedia(now); break;
+      case Page::Coin: drawCoin(now); break;
+      case Page::Settings: drawSettings(); break;
     }
     if (phaseFlash && (now / 200) % 2 == 0) canvas_.drawRoundRect(1, 1, 158, 78, 6, UiColor::accents[1]);
     canvas_.pushSprite(0, 0);
@@ -172,7 +206,9 @@ class DeviceUI {
   }
 
  private:
-  static constexpr uint8_t functionCount = 6;
+  static constexpr uint8_t functionCount = 8;
+  ConnectionMode connectionMode_ = ConnectionMode::Wifi;
+  uint8_t selectedConnection_ = 0;
   TFT_eSPI& display_;
   TFT_eSprite canvas_;
   Page page_ = Page::Menu;
@@ -186,6 +222,8 @@ class DeviceUI {
   bool dirty_ = true;
   bool animating_ = false;
   bool previousNotice_ = false;
+  bool coinSpinning_ = false;
+  uint32_t coinAnimationStart_ = 0;
   uint32_t animationStart_ = 0;
   uint32_t lastDraw_ = 0;
   uint32_t lastSecond_ = 0;
@@ -212,16 +250,16 @@ class DeviceUI {
     while (*value) width += nextCodepoint(value) < 128 ? 6 : uiGlyphWidth;
     return width;
   }
-  void text(int x, int y, const char* value, uint16_t color) {
+  void text(int x, int y, const char* value, uint16_t color, uint8_t scale = 1) {
     canvas_.setTextFont(1);
-    canvas_.setTextSize(1);
+    canvas_.setTextSize(scale);
     canvas_.setTextColor(color);
     while (*value) {
       const uint32_t codepoint = nextCodepoint(value);
       if (codepoint < 128) {
-        canvas_.setCursor(x, y + (uiGlyphHeight - 8) / 2);
+        canvas_.setCursor(x, y + (uiGlyphHeight - 8) / 2 * scale);
         canvas_.write(uint8_t(codepoint));
-        x += 6;
+        x += 6 * scale;
       } else {
         unsigned low = 0, high = uiGlyphCount;
         while (low < high) {
@@ -233,18 +271,22 @@ class DeviceUI {
           for (int row = 0; row < uiGlyphHeight; ++row) {
             for (int column = 0; column < uiGlyphWidth; ++column) {
               const uint8_t bits = pgm_read_byte(&uiGlyphs[low].rows[row * 2 + column / 8]);
-              if (bits & (0x80 >> (column % 8))) canvas_.drawPixel(x + column, y + row, color);
+              if (bits & (0x80 >> (column % 8))) {
+                if (scale == 1) canvas_.drawPixel(x + column, y + row, color);
+                else canvas_.fillRect(x + column * scale, y + row * scale, scale, scale, color);
+              }
             }
           }
         } else {
-          canvas_.drawRect(x + 1, y + 1, uiGlyphWidth - 2, uiGlyphHeight - 2, color);
+          canvas_.drawRect(x + scale, y + scale, (uiGlyphWidth - 2) * scale,
+                           (uiGlyphHeight - 2) * scale, color);
         }
-        x += uiGlyphWidth;
+        x += uiGlyphWidth * scale;
       }
     }
   }
-  void centered(int center, int y, const char* value, uint16_t color) {
-    text(center - textWidth(value) / 2, y, value, color);
+  void centered(int center, int y, const char* value, uint16_t color, uint8_t scale = 1) {
+    text(center - textWidth(value) * scale / 2, y, value, color, scale);
   }
   void big(int center, int y, const char* value, uint16_t color, uint8_t size = 2) {
     canvas_.setTextColor(color);
@@ -328,6 +370,22 @@ class DeviceUI {
         canvas_.drawCircle(x + 16, y + 16, 14, color);
         canvas_.fillTriangle(x + 12, y + 8, x + 12, y + 24, x + 23, y + 16, color);
         break;
+      case 6:
+        canvas_.drawCircle(x + 16, y + 16, 14, color);
+        canvas_.drawCircle(x + 16, y + 16, 11, color);
+        canvas_.drawFastVLine(x + 16, y + 8, 17, color);
+        canvas_.drawFastHLine(x + 11, y + 12, 10, color);
+        canvas_.drawFastHLine(x + 11, y + 20, 10, color);
+        break;
+      case 7:
+        canvas_.drawCircle(x + 16, y + 16, 11, color);
+        canvas_.drawCircle(x + 16, y + 16, 5, color);
+        for (int i = 0; i < 8; ++i) {
+          const float angle = i * 0.78539816f;
+          canvas_.drawLine(x + 16 + lroundf(cosf(angle) * 11), y + 16 + lroundf(sinf(angle) * 11),
+                           x + 16 + lroundf(cosf(angle) * 15), y + 16 + lroundf(sinf(angle) * 15), color);
+        }
+        break;
     }
   }
   static const char* title(uint8_t index) {
@@ -337,12 +395,14 @@ class DeviceUI {
       case 2: return "硬件监控";
       case 3: return "时钟";
       case 4: return "电脑音量";
-      default: return "媒体控制";
+      case 5: return "媒体控制";
+      case 6: return "抛硬币";
+      default: return "设置";
     }
   }
   void hero(uint8_t index, int y) {
     static const char* captions[] = {"COPY / PASTE", "FOCUS & BREAK", "CPU  RAM  GPU",
-                                     "TIME & DATE", "SYSTEM AUDIO", "PLAY / PAUSE"};
+                                     "TIME & DATE", "SYSTEM AUDIO", "PLAY / PAUSE", "HEADS / TAILS", "CONNECTION"};
     canvas_.fillRoundRect(4, y, 152, 45, 7, UiColor::card);
     canvas_.drawRoundRect(4, y, 152, 45, 7, UiColor::line);
     canvas_.fillRoundRect(4, y + 11, 3, 23, 1, UiColor::accents[index]);
@@ -497,5 +557,63 @@ class DeviceUI {
     centered(80, 55, showingNotice(now) ? noticeText_ : "左键返回", 
              showingNotice(now) ? noticeColor_ : UiColor::muted);
     footer("↑上一首 中播放/暂停 ↓下一首");
+  }
+  void drawSettings() {
+    header("连接设置", UiColor::accents[7]);
+    static const char* names[] = {"WiFi 连接", "USB 连接", "蓝牙 BLE"};
+    for (uint8_t i = 0; i < 3; ++i) {
+      const int y = 18 + i * 15;
+      if (i == selectedConnection_) {
+        canvas_.fillRoundRect(4, y, 152, 14, 3, UiColor::card);
+        canvas_.drawRoundRect(4, y, 152, 14, 3, UiColor::accents[7]);
+      }
+      text(10, y + 2, names[i], i == selectedConnection_ ? UiColor::text : UiColor::muted);
+      if (i == static_cast<uint8_t>(connectionMode_))
+        text(115, y + 2, "已选", UiColor::green);
+    }
+    footer("←返回 ↑↓选 中确认");
+  }
+  void drawCoin(uint32_t now) {
+    const bool ready = coin.face != CoinFlip::Face::None;
+    const bool heads = coin.face == CoinFlip::Face::Heads;
+    const uint16_t accent = ready && !heads ? UiColor::accents[3] : UiColor::accents[6];
+    header("抛硬币", UiColor::accents[6]);
+    if (coinSpinning_) {
+      float progress = float(uint32_t(now - coinAnimationStart_)) / coinAnimationMs;
+      if (progress > 1) progress = 1;
+      const float eased = 1 - (1 - progress) * (1 - progress);
+      // Slow down over three turns, then land on the already sampled result.
+      // Drawing never consumes random numbers or changes the chosen face.
+      const float rotation = eased * (heads ? 6 : 7) * 3.14159265f;
+      const float facing = cosf(rotation);
+      const int radius = 18 + lroundf(4 * progress);
+      const int halfWidth = max(2, int(lroundf(radius * fabsf(facing))));
+      const int y = 41 - lroundf(5 * sinf(progress * 3.14159265f));
+      const uint16_t sideColor = facing >= 0 ? UiColor::accents[6] : UiColor::accents[3];
+      canvas_.fillEllipse(32, 64, 12 + lroundf(4 * progress), 1, UiColor::line);
+      canvas_.fillEllipse(32, y, halfWidth, radius, UiColor::card);
+      canvas_.drawEllipse(32, y, halfWidth, radius, sideColor);
+      if (halfWidth > 4) canvas_.drawEllipse(32, y, halfWidth - 3, radius - 3, sideColor);
+      if (halfWidth >= 10) centered(32, y - 5, facing >= 0 ? "正" : "反", sideColor);
+      centered(106, 26, "抛掷中", UiColor::text);
+      centered(106, 40, "FLIPPING", UiColor::muted);
+      canvas_.fillRoundRect(74, 56, 64, 5, 2, UiColor::line);
+      const int width = lroundf(64 * progress);
+      if (width) canvas_.fillRect(74, 56, width, 5, UiColor::accents[6]);
+      footer("←返回 请稍候");
+      return;
+    }
+    canvas_.fillCircle(32, 41, 22, UiColor::card);
+    canvas_.drawCircle(32, 41, 22, accent);
+    canvas_.drawCircle(32, 41, 19, accent);
+    if (ready) {
+      centered(32, 36, heads ? "正" : "反", accent);
+      centered(106, 26, heads ? "正面" : "反面", accent, 2);
+      centered(106, 51, heads ? "HEADS" : "TAILS", UiColor::muted);
+    } else {
+      big(32, 27, "?", accent, 1);
+      centered(106, 35, "按中键抛硬币", UiColor::text);
+    }
+    footer("←返回 中键再抛");
   }
 };

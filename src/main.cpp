@@ -1,15 +1,12 @@
 #include <Arduino.h>
-#include <ArduinoJson.h>
-#include <HTTPClient.h>
 #include <TFT_eSPI.h>
-#include <WiFi.h>
-#include <atomic>
 #include <esp_system.h>
 #include <sys/time.h>
 #include "board_config.h"
 #include "debounced_button.h"
 #include "device_state.h"
 #include "device_ui.h"
+#include "pc_link.h"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -22,12 +19,8 @@ constexpr bool configured = false;
 namespace {
 TFT_eSPI display;
 DeviceUI ui(display);
-std::atomic<bool> pcOnline{false};
-QueueHandle_t events;
-QueueHandle_t results;
-QueueHandle_t snapshots;
+PcLink pcLink;
 PcSnapshot latestSnapshot;
-char sessionId[17];
 uint32_t sequence = 0;
 
 struct Key {
@@ -45,123 +38,30 @@ Key keys[] = {
     {Board::keyRight, KeyId::Right, "RIGHT", {}, 0},
 };
 
-struct Reply { int code; String body; };
-
-// Only the worker uses HTTP. A slow PC never blocks button scans or the timer.
-Reply request(const char* path, const String* payload = nullptr) {
-  WiFiClient client;
-  HTTPClient http;
-  http.setConnectTimeout(450);
-  http.setTimeout(700);
-  http.setReuse(false);
-  const String url = String("http://") + PC_HOST + ":" + PC_PORT + path;
-  if (!http.begin(client, url)) return {-1, ""};
-  http.addHeader("Authorization", String("Bearer ") + API_TOKEN);
-  int code;
-  if (payload) {
-    http.addHeader("Content-Type", "application/json");
-    code = http.POST(*payload);
-  } else code = http.GET();
-  String body = code > 0 ? http.getString() : String();
-  http.end();
-  return {code, body};
-}
-
-float metric(JsonVariantConst value) {
-  if (value.isNull() || !value.is<float>()) return -1;
-  const float result = value.as<float>();
-  return isfinite(result) && result >= 0 ? result : -1;
-}
-
-PcSnapshot readSnapshot() {
-  PcSnapshot snapshot;
-  snapshot.receivedAt = millis();
-  if (WiFi.status() != WL_CONNECTED) return snapshot;
-  const Reply reply = request("/status");
-  if (reply.code == 200) {
-    StaticJsonDocument<1536> document;
-    if (!deserializeJson(document, reply.body) && document["ok"] == true) {
-      snapshot.online = true;
-      snapshot.epoch = document["epoch"] | 0UL;
-      const JsonObjectConst stats = document["stats"].as<JsonObjectConst>();
-      snapshot.metricsAvailable = stats["available"] | false;
-      snapshot.sampleAgeMs = stats["age_ms"] | 0UL;
-      snapshot.cpu = metric(stats["cpu"]);
-      snapshot.ram = metric(stats["ram"]);
-      snapshot.gpu = metric(stats["gpu"]);
-      snapshot.disk = metric(stats["disk"]);
-      snapshot.cpuTemp = metric(stats["cpu_temp"]);
-      snapshot.gpuTemp = metric(stats["gpu_temp"]);
-      snapshot.vram = metric(stats["vram"]);
-      const JsonObjectConst audio = document["audio"].as<JsonObjectConst>();
-      if (audio["available"] == true && !audio["volume"].isNull()) {
-        const int volume = audio["volume"].as<int>();
-        snapshot.volume = volume >= 0 && volume <= 100 ? volume : -1;
-        snapshot.muted = audio["muted"] | false;
-      }
-      snapshot.receivedAt = millis();
-      return snapshot;
-    }
-  }
-  // An older receiver can still handle copy/paste; telemetry remains unavailable.
-  const Reply health = request("/health");
-  snapshot.online = health.code == 200 && health.body == "{\"ok\":true}";
-  snapshot.receivedAt = millis();
-  return snapshot;
-}
-
-void networkTask(void*) {
-  uint32_t lastPoll = millis() - Board::statusPollMs;
-  bool refresh = true;
-  bool networkClockStarted = false;
-  for (;;) {
-    if (!networkClockStarted && WiFi.status() == WL_CONNECTED) {
-      configTzTime("CST-8", "ntp.aliyun.com", "pool.ntp.org");
-      networkClockStarted = true;
-    }
-    Event event;
-    if (xQueueReceive(events, &event, pdMS_TO_TICKS(15)) == pdTRUE) {
-      Result result{event.sequence, event.action, Outcome::Offline};
-      if (uint32_t(millis() - event.createdAt) > Board::eventMaxAgeMs) {
-        result.outcome = Outcome::Expired;
-      } else if (WiFi.status() == WL_CONNECTED) {
-        char payload[160];
-        snprintf(payload, sizeof(payload), "{\"id\":\"%s-%lu\",\"action\":\"%s\"}",
-                 sessionId, static_cast<unsigned long>(event.sequence), actionName(event.action));
-        const String body(payload);
-        const Reply reply = request("/event", &body);
-        if (reply.code == 200 && reply.body == "{\"ok\":true}") result.outcome = Outcome::Confirmed;
-        else if (reply.code == 403) result.outcome = Outcome::Denied;
-        else if (reply.code == 400 || reply.code == 401 || reply.code == 409) result.outcome = Outcome::Rejected;
-        else if (reply.code > 0) result.outcome = Outcome::Failed;
-        else { result.outcome = Outcome::Unknown; pcOnline.store(false); }
-        // Never retry an action: a response may be lost after a successful paste.
-      }
-      xQueueSend(results, &result, portMAX_DELAY);
-      refresh = true;
-    }
-    if (refresh || uint32_t(millis() - lastPoll) >= Board::statusPollMs) {
-      PcSnapshot snapshot = readSnapshot();
-      pcOnline.store(snapshot.online);
-      xQueueOverwrite(snapshots, &snapshot);
-      lastPoll = millis();
-      refresh = false;
-    }
-  }
-}
-
 void onKey(KeyId id, const char* name) {
   const uint32_t now = millis();
   const Action action = ui.key(id, now);
   Serial.printf("KEY %s page=%u selected=%u action=%s\n", name,
                 static_cast<unsigned>(ui.page()), ui.selected(), actionName(action));
+  if (action == Action::SetWifi || action == Action::SetUsb || action == Action::SetBluetooth) {
+    const ConnectionMode mode = action == Action::SetWifi ? ConnectionMode::Wifi :
+                                action == Action::SetUsb ? ConnectionMode::Usb : ConnectionMode::Bluetooth;
+    if (pcLink.select(mode)) {
+      latestSnapshot = PcSnapshot{};
+      ui.snapshot(latestSnapshot);
+      ui.visibleSequence = 0;
+      ui.setConnection(mode, pcLink.connected());
+      Serial.printf("LINK mode=%s saved=1\n", connectionName(mode));
+    }
+    return;
+  }
   if (action == Action::None) return;
-  if (!configured || WiFi.status() != WL_CONNECTED || !pcOnline.load()) {
+  if (!pcLink.online()) {
     ui.offline(action, configured, now);
     return;
   }
-  Event event{++sequence, now, action};
-  if (xQueueSend(events, &event, 0) != pdTRUE) ui.busy(now);
+  const Event event{++sequence, now, action};
+  if (!pcLink.send(event)) ui.busy(now);
   else ui.queued(action, event.sequence, now);
 }
 
@@ -170,8 +70,9 @@ void syncClock(const PcSnapshot& snapshot) {
   static uint32_t lastSync = 0;
   const time_t current = time(nullptr);
   if (current < 1700000000 || llabs(int64_t(current) - snapshot.epoch) > 2 ||
+      (pcLink.mode() != ConnectionMode::Wifi && uint32_t(millis() - lastSync) > 1000) ||
       uint32_t(millis() - lastSync) > 60000) {
-    struct timeval value{static_cast<time_t>(snapshot.epoch), 0};
+    struct timeval value{static_cast<time_t>(snapshot.epoch), static_cast<suseconds_t>(snapshot.epochFractionMs) * 1000};
     settimeofday(&value, nullptr);
     lastSync = millis();
   }
@@ -179,7 +80,73 @@ void syncClock(const PcSnapshot& snapshot) {
 
 // Local visual diagnostics. Credentials are never exposed.
 void serialCommand(const String& command) {
-  if (command == "UI TEST MEDIA") {
+  if (command == "UI TEST SETTINGS") {
+    DeviceUI isolated(display);
+    isolated.setConnection(ConnectionMode::Wifi, false);
+    isolated.debugPage(8, 100);
+    const bool wifi = isolated.key(KeyId::Center, 100) == Action::SetWifi;
+    isolated.key(KeyId::Down, 101);
+    const bool usb = isolated.key(KeyId::Center, 102) == Action::SetUsb;
+    isolated.key(KeyId::Down, 103);
+    const bool ble = isolated.key(KeyId::Center, 104) == Action::SetBluetooth;
+    isolated.key(KeyId::Down, 105);
+    const bool wrap = isolated.selectedConnection() == 0;
+    isolated.key(KeyId::Up, 106);
+    const bool reverse = isolated.selectedConnection() == 2;
+    isolated.key(KeyId::Left, 107);
+    const bool back = isolated.page() == Page::Menu;
+    Serial.printf("SETTINGS_TEST %s wifi=%u usb=%u ble=%u wrap=%u back=%u\n",
+                  wifi && usb && ble && wrap && reverse && back ? "PASS" : "FAIL",
+                  wifi, usb, ble, wrap && reverse, back);
+  } else if (command == "UI TEST COIN") {
+    // Deterministic edge cases exercise the same mapping as real tosses.
+    // Production CoinFlip objects use esp_random; only this probe substitutes it.
+    CoinFlip even([]() -> uint32_t { return 0; });
+    CoinFlip odd([]() -> uint32_t { return UINT32_MAX; });
+    even.toss(); odd.toss();
+    const bool mapping = even.face == CoinFlip::Face::Tails && odd.face == CoinFlip::Face::Heads;
+    odd.toss();
+    const bool streak = odd.face == CoinFlip::Face::Heads && odd.tosses == 2;
+    DeviceUI isolated(display);
+    isolated.debugPage(7, 100);
+    const bool enter = isolated.coin.face == CoinFlip::Face::None && isolated.coin.tosses == 0;
+    const bool local = isolated.key(KeyId::Center, 100) == Action::None &&
+                       isolated.coin.tosses == 1 && isolated.coin.face != CoinFlip::Face::None &&
+                       isolated.coinSpinning();
+    isolated.key(KeyId::Center, 200);
+    const bool repeated = isolated.coin.tosses == 1;
+    isolated.tick(100 + DeviceUI::coinAnimationMs - 1);
+    const bool spinning = isolated.coinSpinning();
+    isolated.tick(100 + DeviceUI::coinAnimationMs);
+    const bool landed = !isolated.coinSpinning();
+    isolated.key(KeyId::Up, 1400);
+    isolated.key(KeyId::Down, 1400);
+    isolated.key(KeyId::Right, 1400);
+    const bool otherKeys = isolated.coin.tosses == 1;
+    isolated.key(KeyId::Center, 2000);
+    isolated.key(KeyId::Left, 2100);
+    const bool back = isolated.page() == Page::Menu && isolated.coinSpinning();
+    isolated.tick(3200);
+    const bool background = !isolated.coinSpinning() && isolated.coin.tosses == 2;
+    isolated.debugPage(7, 0xffffff00UL);
+    isolated.key(KeyId::Center, 0xffffff00UL);
+    isolated.tick(0x100);
+    const bool wrapPending = isolated.coinSpinning();
+    isolated.tick(0x500);
+    const bool wrap = wrapPending && !isolated.coinSpinning();
+    const bool animation = repeated && spinning && landed && background && wrap;
+    CoinFlip samples;
+    unsigned heads = 0;
+    for (unsigned i = 0; i < 256; ++i) {
+      samples.toss();
+      if (samples.face == CoinFlip::Face::Heads) ++heads;
+    }
+    // Smoke check only: a finite sample is not a proof of randomness.
+    const bool sampling = heads > 0 && heads < 256;
+    Serial.printf("COIN_TEST %s mapping=%u streak=%u enter=%u local=%u other=%u back=%u animation=%u heads=%u tails=%u\n",
+                  mapping && streak && enter && local && otherKeys && back && animation && sampling ? "PASS" : "FAIL",
+                  mapping, streak, enter, local, otherKeys, back, animation, heads, 256 - heads);
+  } else if (command == "UI TEST MEDIA") {
     DeviceUI isolated(display);
     isolated.debugPage(6, millis());
     const bool actions = isolated.key(KeyId::Center, 0) == Action::PlayPause &&
@@ -215,10 +182,13 @@ void serialCommand(const String& command) {
     Serial.println("UI PAGE OK");
   } else if (command == "UI STATE") {
     Serial.printf("UI_STATE page=%u selected=%u pc=%u cpu=%.1f ram=%.1f gpu=%.1f volume=%d "
-                  "pomo_seconds=%lu running=%u heap=%u\n", static_cast<unsigned>(ui.page()),
+                  "pomo_seconds=%lu running=%u coin=%u tosses=%lu coin_anim=%u mode=%s conn_selected=%u heap=%u\n", static_cast<unsigned>(ui.page()),
                   ui.selected(), latestSnapshot.online, latestSnapshot.cpu, latestSnapshot.ram,
                   latestSnapshot.gpu, latestSnapshot.volume,
                   static_cast<unsigned long>(ui.pomodoro.secondsLeft()), ui.pomodoro.running,
+                  static_cast<unsigned>(ui.coin.face), static_cast<unsigned long>(ui.coin.tosses),
+                  ui.coinSpinning(),
+                  connectionName(pcLink.mode()), ui.selectedConnection(),
                   ESP.getFreeHeap());
   } else if (command.startsWith("UI KEY ")) {
     const String name = command.substring(7);
@@ -232,7 +202,7 @@ void serialCommand(const String& command) {
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("[BOOT] Six-function controller UI v3 (10px Chinese, media keys)");
+  Serial.println("[BOOT] Controller UI v6: WiFi / USB / BLE connections");
   Serial.printf("[TFT] MOSI=%d SCLK=%d CS=%d DC=%d RST=%d BL=%u SPI=0x%08lx\n",
                 TFT_MOSI, TFT_SCLK, TFT_CS, TFT_DC, TFT_RST, Board::backlight,
                 static_cast<unsigned long>(REG_SPI_BASE(SPI2_HOST)));
@@ -254,28 +224,17 @@ void setup() {
   }
   setenv("TZ", "CST-8", 1);
   tzset();
-  snprintf(sessionId, sizeof(sessionId), "%08lx%08lx",
-           static_cast<unsigned long>(esp_random()), static_cast<unsigned long>(esp_random()));
-  events = xQueueCreate(4, sizeof(Event));
-  results = xQueueCreate(8, sizeof(Result));
-  snapshots = xQueueCreate(1, sizeof(PcSnapshot));
-  if (!events || !results || !snapshots) {
-    Serial.println("[ERROR] Queue allocation failed");
-    while (true) delay(1000);
-  }
   ui.pomodoro.reset(millis());
   ui.render(millis(), true);
-  if (configured) {
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
-    WiFi.persistent(false);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    if (xTaskCreate(networkTask, "pc-link", 8192, nullptr, 1, nullptr) != pdPASS) {
-      Serial.println("[ERROR] Network task allocation failed");
-      while (true) delay(1000);
-    }
-    Serial.printf("[PC] Endpoint http://%s:%u (token hidden)\n", PC_HOST, PC_PORT);
-  } else Serial.println("[CONFIG] Run python tools/configure.py and rebuild/upload.");
+  const PcLink::Config config{configured && strlen(WIFI_SSID) > 0, WIFI_SSID, WIFI_PASSWORD,
+                              PC_HOST, PC_PORT, API_TOKEN};
+  if (!pcLink.begin(config)) {
+    Serial.println("[ERROR] Connection manager initialization failed");
+    while (true) delay(1000);
+  }
+  ui.setConnection(pcLink.mode(), pcLink.connected());
+  Serial.printf("[LINK] Saved mode: %s; USB serial / BLE / WiFi supported\n", connectionName(pcLink.mode()));
+  Serial.println("[RNG] Hardware RNG with initialized RF entropy");
   Serial.printf("[KEYS] UP=%u DOWN=%u CENTER=%u LEFT=%u RIGHT=%u\n",
                 Board::keyUp, Board::keyDown, Board::keyCenter, Board::keyLeft, Board::keyRight);
   Serial.println("[BOOT] Menu ready: UP/DOWN select, CENTER enter, LEFT back");
@@ -284,6 +243,12 @@ void setup() {
 void loop() {
   const uint32_t now = millis();
   ui.tick(now);
+  PcSnapshot snapshot;
+  if (pcLink.takeSnapshot(snapshot)) {
+    latestSnapshot = snapshot;
+    ui.snapshot(snapshot);
+    syncClock(snapshot);
+  }
   for (auto& key : keys) {
     if (key.debounce.update(digitalRead(key.pin) == LOW, now, Board::debounceMs)) {
       onKey(key.id, key.name);
@@ -296,28 +261,32 @@ void loop() {
       key.repeatAt = now + Board::repeatIntervalMs;
     }
   }
-  PcSnapshot snapshot;
-  if (xQueueReceive(snapshots, &snapshot, 0) == pdTRUE) {
-    latestSnapshot = snapshot;
-    ui.snapshot(snapshot);
-    syncClock(snapshot);
-  }
   Result result;
-  while (xQueueReceive(results, &result, 0) == pdTRUE) {
+  while (pcLink.takeResult(result)) {
     ui.result(result, now);
     Serial.printf("EVENT %lu action=%s result=%u\n", static_cast<unsigned long>(result.sequence),
                   actionName(result.action), static_cast<unsigned>(result.outcome));
   }
-  ui.setWifi(WiFi.status() == WL_CONNECTED);
+  ui.setConnection(pcLink.mode(), pcLink.connected());
   ui.render(now);
   static String command;
-  while (Serial.available()) {
+  static bool overflow = false;
+  unsigned budget = 512;
+  while (Serial.available() && budget--) {
     const char value = Serial.read();
     if (value == '\n') {
-      command.trim();
-      serialCommand(command);
+      if (!overflow) {
+        command.trim();
+        if (command.startsWith("{")) pcLink.serialLine(command);
+        else serialCommand(command);
+      }
       command = "";
-    } else if (value != '\r' && command.length() < 64) command += value;
+      overflow = false;
+    } else if (value != '\r' && !overflow) {
+      if (command.length() < 2047) command += value;
+      else { command = ""; overflow = true; }
+    }
   }
+  pcLink.pollSerialTx();
   delay(2);
 }

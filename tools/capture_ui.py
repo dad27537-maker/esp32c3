@@ -1,7 +1,7 @@
 """Capture the actual device framebuffer as PNG; optionally check UI navigation.
 
 Uses pyserial (already bundled with PlatformIO) and Python's standard library.
-Control checks navigate menus/timers only; they never send PC shortcuts/audio.
+Control checks navigate menus/timers/coin only; they never send PC shortcuts/audio.
 """
 from __future__ import annotations
 
@@ -83,10 +83,40 @@ class Device:
                     raise AssertionError(f"Expected {key}={value}, actual state {state}")
 
         self.command("UI PAGE 1", "UI PAGE OK")
+        before_coin = self.state()
+        next_toss = int(before_coin["tosses"]) + 1
         require(self.key("LEFT"), page=0, selected=0)
+        require(self.key("UP"), page=0, selected=7)
+        settings = self.key("CENTER")
+        require(settings, page=8)
+        original_selection = int(settings["conn_selected"])
+        require(self.key("DOWN"), page=8, conn_selected=(original_selection + 1) % 3,
+                mode=settings["mode"])
+        require(self.key("UP"), page=8, conn_selected=original_selection, mode=settings["mode"])
+        require(self.key("LEFT"), page=0, selected=7)
+        require(self.key("UP"), page=0, selected=6)
+        require(self.key("CENTER"), page=7, coin=before_coin["coin"], tosses=before_coin["tosses"])
+        tossed = self.key("CENTER")
+        require(tossed, page=7, tosses=next_toss, coin_anim=1)
+        require(self.key("CENTER"), page=7, tosses=next_toss, coin=tossed["coin"])
+        if tossed["coin"] not in ("1", "2"):
+            raise AssertionError("Coin result missing")
+        for key in ("UP", "DOWN", "RIGHT"):
+            require(self.key(key), page=7, tosses=next_toss, coin=tossed["coin"])
+        require(self.key("LEFT"), page=0, selected=6)
+        require(self.key("CENTER"), page=7, tosses=next_toss, coin=tossed["coin"])
+        deadline = time.monotonic() + 3
+        settled = self.state()
+        while settled["coin_anim"] == "1" and time.monotonic() < deadline:
+            time.sleep(0.05)
+            settled = self.state()
+        require(settled, coin_anim=0, tosses=next_toss, coin=tossed["coin"])
+        require(self.key("LEFT"), page=0)
         require(self.key("UP"), page=0, selected=5)
         require(self.key("CENTER"), page=6)
         require(self.key("LEFT"), page=0, selected=5)
+        require(self.key("DOWN"), page=0, selected=6)
+        require(self.key("DOWN"), page=0, selected=7)
         require(self.key("DOWN"), page=0, selected=0)
         require(self.key("CENTER"), page=1)
         require(self.key("LEFT"), page=0)
@@ -115,6 +145,14 @@ class Device:
         if "MEDIA_TEST PASS" not in media:
             raise AssertionError(media)
         print(media)
+        coin = self.command("UI TEST COIN", "COIN_TEST")
+        if "COIN_TEST PASS" not in coin:
+            raise AssertionError(coin)
+        print(coin)
+        settings = self.command("UI TEST SETTINGS", "SETTINGS_TEST")
+        if "SETTINGS_TEST PASS" not in settings:
+            raise AssertionError(settings)
+        print(settings)
 
 
 def main():
@@ -128,7 +166,7 @@ def main():
     try:
         if args.check_controls:
             device.check_controls()
-        names = ("menu", "clipboard", "pomodoro", "hardware", "clock", "volume", "media")
+        names = ("menu", "clipboard", "pomodoro", "hardware", "clock", "volume", "media", "coin", "settings")
         frames = []
         for page, name in enumerate(names):
             frame = device.frame(page)

@@ -71,4 +71,4 @@ GPIO8、GPIO9 参与芯片启动配置，开机 / 复位时释放所有方向键
 
 若实物实际上为另一种 USB 直连精简版，需在 `platformio.ini` 的 `build_flags` 加入 `-D ARDUINO_USB_CDC_ON_BOOT=1`，并按该版本确认下载驱动和端口；GPIO18 / 19 会用于 USB。这一变体未在本次硬件上验证。
 
-ESP32-C3 内置 USB 外设是固定功能 Serial/JTAG，不能用普通 Arduino USB Keyboard 库直接变成通用 USB HID 键盘，见[乐鑫说明](https://docs.espressif.com/projects/esp-idf/en/stable/esp32c3/get-started/establish-serial-connection.html)。本工程使用 WiFi + Windows 接收端实现快捷键。
+ESP32-C3 内置 USB 外设是固定功能 Serial/JTAG，不能用普通 Arduino USB Keyboard 库直接变成通用 USB HID 键盘，见[乐鑫说明](https://docs.espressif.com/projects/esp-idf/en/stable/esp32c3/get-started/establish-serial-connection.html)。本工程的USB模式通过CH343串口接入Windows接收端，蓝牙模式通过加密BLE数据服务接入同一接收端，WiFi模式沿用局域网接口。三种连接都支持电脑指令、硬件数据和校时；电脑接收程序需要保持运行。

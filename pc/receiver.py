@@ -159,6 +159,14 @@ class Handler(BaseHTTPRequestHandler):
         value = self.headers.get("Authorization", "").encode("utf-8")
         expected = ("Bearer " + self.server.token).encode("utf-8")
         if not hmac.compare_digest(value, expected):
+            # Drain a bounded ordinary body before closing. Otherwise Windows
+            # can reset the connection and hide the 401 behind WinError 10053.
+            try:
+                size = int(self.headers.get("Content-Length", "0"))
+                if 0 < size <= 512 and not self.headers.get("Transfer-Encoding"):
+                    self.rfile.read(size)
+            except (ValueError, OSError):
+                pass
             self.reply(401)
             return False
         return True
@@ -241,9 +249,13 @@ def main() -> int:
     parser.add_argument("--config", type=Path,
                         default=Path(__file__).with_name("receiver_config.json"))
     parser.add_argument("--dry-run", action="store_true", help="Receive/log only; inject no keys")
+    parser.add_argument("--links", default="wifi,usb,ble",
+                        help="Enabled links: wifi,usb,ble; use wifi alone for serial diagnostics/upload")
+    parser.add_argument("--usb-port", help="Force a USB COM port; default: discover CH343 automatically")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     monitor = None
+    workers = None
     try:
         config = json.loads(args.config.read_text(encoding="utf-8"))
         audio = None
@@ -254,7 +266,10 @@ def main() -> int:
             audio = WindowsAudio()
             monitor = SystemMonitor()
             execute = DesktopController(WindowsKeyboard(), audio)
-        server = Receiver(("0.0.0.0", int(config.get("port", 8765))),
+        links = set(args.links.split(","))
+        if not links or not links <= {"wifi", "usb", "ble"}:
+            raise ValueError("--links must contain wifi, usb and/or ble")
+        server = Receiver(("0.0.0.0" if "wifi" in links else "127.0.0.1", int(config.get("port", 8765))),
                           config["token"], execute, dry_run=args.dry_run,
                           status_provider=monitor, audio=audio)
     except FileNotFoundError:
@@ -266,11 +281,17 @@ def main() -> int:
     LOG.info("Keep this program running; focus the application to copy/paste. Ctrl+C here stops it.")
     LOG.info("Hardware/time status: /status; master volume and media control enabled%s",
              " (dry-run: no output)" if args.dry_run else "")
+    from device_links import LinkWorkers
+    workers = LinkWorkers(config, links, args.usb_port)
+    workers.start()
+    LOG.info("Enabled connections: %s", ", ".join(sorted(links)))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         LOG.info("Stopped")
     finally:
+        if workers:
+            workers.close()
         server.server_close()
         if monitor:
             monitor.close()
